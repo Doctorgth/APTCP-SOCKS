@@ -1,0 +1,15 @@
+version: '3.3'
+
+services:
+  aptcp-server:
+    build: .
+    container_name: aptcp-socks-server
+    restart: unless-stopped
+    ports:
+      - "1080:1080"
+    volumes:
+      - ./server/config.json:/app/server/config.json
+      - ./server/users.jsonl:/app/server/users.jsonl
+      # Для использования TLS раскомментируйте строки ниже и положите сертификаты в папку server:
+      # - ./server/cert.pem:/app/server/cert.pem
+      # - ./server/key.pem:/app/server/key.pem

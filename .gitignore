@@ -1,0 +1,41 @@
+# Системные файлы Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+ENV/
+
+# Файлы настроек IDE (PyCharm, VS Code)
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Конфигурационные файлы проекта (Игнорируем реальные рабочие файлы)
+client/config.json
+client/users.jsonl
+server/config.json
+server/users.jsonl
+
+# При этом файлы шаблонов (*.example) будут отслеживаться гитом автоматически, 
+# так как правила выше блокируют только конкретные пути.
+
+# TLS сертификаты и приватные ключи (Игнорируем всё секретное)
+*.pem
+*.key
+*.crt
+*.csr
+server/*.pem
+server/*.key
+client/*.pem
+client/*.key

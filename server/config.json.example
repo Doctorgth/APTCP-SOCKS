@@ -1,0 +1,10 @@
+{
+  "aptcp_host": "0.0.0.0",
+  "aptcp_port": 1080,
+  "auth_enabled": true,
+  "users_file": "server/users.jsonl",
+  "timeout": 30,
+  "tls_enabled": false,
+  "tls_cert": "server/cert.pem",
+  "tls_key": "server/key.pem"
+}

@@ -1,0 +1,14 @@
+{
+  "socks_host": "127.0.0.1",
+  "socks_port": 1080,
+  "auth_enabled": true,
+  "users_file": "client/users.jsonl",
+  "aptcp_server_host": "ВАШ_IP_СЕРВЕРА",
+  "aptcp_server_port": 1080,
+  "aptcp_auth_enabled": true,
+  "aptcp_username": "client_user",
+  "aptcp_password": "client_password",
+  "aptcp_tls_enabled": false,
+  "aptcp_tls_ca_cert": "client/server_cert.pem",
+  "timeout": 30
+}
