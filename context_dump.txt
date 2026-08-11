@@ -1,0 +1,847 @@
+.gitignore
+# Системные файлы Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+ENV/
+
+# Файлы настроек IDE (PyCharm, VS Code)
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# Конфигурационные файлы проекта (Игнорируем реальные рабочие файлы)
+client/config.json
+client/users.jsonl
+server/config.json
+server/users.jsonl
+
+# При этом файлы шаблонов (*.example) будут отслеживаться гитом автоматически, 
+# так как правила выше блокируют только конкретные пути.
+
+# TLS сертификаты и приватные ключи (Игнорируем всё секретное)
+*.pem
+*.key
+*.crt
+*.csr
+server/*.pem
+server/*.key
+client/*.pem
+client/*.key
+----------
+
+server\__init__.py
+[READ_ONLY]
+# Server package initialization
+----------
+
+server\aptcp_server.py
+[READ_ONLY]
+import asyncio
+import logging
+import ssl
+from typing import Dict, Any
+
+from aioptcp import PTCPServer
+from server.socks_handler import TunnelHandler
+
+logger = logging.getLogger("APTCPServer")
+
+
+class APTCPSocksServer:
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.host = config.get("aptcp_host", "0.0.0.0")
+        self.port = int(config.get("aptcp_port", 1080))
+        self.timeout = int(config.get("timeout", 30))
+
+        self.tls_enabled = config.get("tls_enabled", False)
+        self.tls_cert = config.get("tls_cert", "server/cert.pem")
+        self.tls_key = config.get("tls_key", "server/key.pem")
+
+        ssl_ctx = None
+        if self.tls_enabled:
+            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ssl_ctx.load_cert_chain(certfile=self.tls_cert, keyfile=self.tls_key)
+
+        self.handler = TunnelHandler(config)
+        self.ptcp_server = PTCPServer(self.host, self.port, timeout=self.timeout, ssl=ssl_ctx)
+
+    async def start(self):
+        await self.ptcp_server.start()
+        logger.info(f"APTCP SOCKS Server listening on {self.host}:{self.port}")
+        asyncio.create_task(self._accept_loop())
+
+    async def _accept_loop(self):
+        while True:
+            try:
+                conn = await self.ptcp_server.accept()
+                asyncio.create_task(self.handler.handle_connection(conn))
+            except Exception as e:
+                logger.error(f"Error accepting APTCP connection: {e}")
+                await asyncio.sleep(0.1)
+----------
+
+server\config.json
+[READ_ONLY]
+{
+  "aptcp_host": "0.0.0.0",
+  "aptcp_port": 1080,
+  "auth_enabled": true,
+  "users_file": "server/users.jsonl",
+  "timeout": 30
+}
+----------
+
+server\config.json.example
+[READ_ONLY]
+{
+  "aptcp_host": "0.0.0.0",
+  "aptcp_port": 1080,
+  "auth_enabled": true,
+  "users_file": "server/users.jsonl",
+  "timeout": 30,
+  "tls_enabled": false,
+  "tls_cert": "server/cert.pem",
+  "tls_key": "server/key.pem"
+}
+----------
+
+server\main.py
+[READ_ONLY]
+import asyncio
+import logging
+import sys
+import os
+
+from common.config import load_json_config
+from server.aptcp_server import APTCPSocksServer
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - Server: %(message)s')
+
+async def main():
+    config_path = sys.argv[1] if len(sys.argv) > 1 else "server/config.json"
+    if not os.path.exists(config_path):
+        logging.error(f"Config file not found: {config_path}")
+        return
+
+    config = load_json_config(config_path)
+    server = APTCPSocksServer(config)
+    await server.start()
+    logging.info("APTCP SOCKS Server running. Press Ctrl+C to stop.")
+    while True:
+        await asyncio.sleep(3600)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
+----------
+
+server\socks_handler.py
+[READ_ONLY]
+import asyncio
+import socket
+import logging
+from typing import Dict, Any
+
+from common.config import load_users_jsonl, validate_credentials
+from common.socks5 import (
+    CMD_CONNECT, CMD_UDP_ASSOCIATE,
+    REP_SUCCESS, REP_CONN_REFUSED, REP_CMD_NOT_SUPPORTED,
+    parse_udp_packet, pack_udp_packet
+)
+from common.tunnel import (
+    PTCPStream, read_tunnel_auth_request, send_tunnel_auth_response,
+    read_tunnel_cmd_request, send_tunnel_cmd_response,
+    TUNNEL_AUTH_USER_PASS, TUNNEL_AUTH_SUCCESS, TUNNEL_AUTH_FAIL,
+    send_udp_frame, read_udp_frame
+)
+
+logger = logging.getLogger("SOCKS5ServerHandler")
+
+
+class TunnelHandler:
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.auth_enabled = config.get("auth_enabled", False)
+        self.users_file = config.get("users_file", "server/users.jsonl")
+        self.users = load_users_jsonl(self.users_file) if self.auth_enabled else {}
+
+    async def handle_connection(self, ptcp_socket: Any):
+        stream = PTCPStream(ptcp_socket)
+        try:
+            # 1. Tunnel Authentication
+            auth_type, username, password = await read_tunnel_auth_request(stream)
+            if self.auth_enabled:
+                if auth_type != TUNNEL_AUTH_USER_PASS or not validate_credentials(self.users, username, password):
+                    logger.warning(f"Server tunnel auth failed for user: {username}")
+                    await send_tunnel_auth_response(stream, TUNNEL_AUTH_FAIL)
+                    await stream.close()
+                    return
+                await send_tunnel_auth_response(stream, TUNNEL_AUTH_SUCCESS)
+            else:
+                await send_tunnel_auth_response(stream, TUNNEL_AUTH_SUCCESS)
+
+            # 2. Command Request
+            cmd, atyp, host, port = await read_tunnel_cmd_request(stream)
+
+            if cmd == CMD_CONNECT:
+                await self._handle_tcp_connect(stream, host, port)
+            elif cmd == CMD_UDP_ASSOCIATE:
+                await self._handle_udp_associate(stream, host, port)
+            else:
+                await send_tunnel_cmd_response(stream, REP_CMD_NOT_SUPPORTED)
+                await stream.close()
+
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass
+        except Exception as e:
+            logger.error(f"Error handling tunnel connection: {e}")
+        finally:
+            try:
+                await stream.close()
+            except Exception:
+                pass
+
+    async def _handle_tcp_connect(self, stream: PTCPStream, host: str, port: int):
+        try:
+            target_reader, target_writer = await asyncio.open_connection(host, port)
+        except Exception as e:
+            logger.warning(f"Target connection failed to {host}:{port} - {e}")
+            await send_tunnel_cmd_response(stream, REP_CONN_REFUSED)
+            return
+
+        await send_tunnel_cmd_response(stream, REP_SUCCESS)
+
+        async def ptcp_to_target():
+            try:
+                while True:
+                    data = await stream.read(65536)
+                    if not data:
+                        break
+                    target_writer.write(data)
+                    await target_writer.drain()
+            except Exception:
+                pass
+
+        async def target_to_ptcp():
+            try:
+                while True:
+                    data = await target_reader.read(65536)
+                    if not data:
+                        break
+                    await stream.send(data)
+            except Exception:
+                pass
+
+        t1 = asyncio.create_task(ptcp_to_target())
+        t2 = asyncio.create_task(target_to_ptcp())
+        done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        target_writer.close()
+
+    async def _handle_udp_associate(self, stream: PTCPStream, host: str, port: int):
+        loop = asyncio.get_running_loop()
+        server_udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server_udp_sock.bind(('0.0.0.0', 0))
+        server_udp_sock.setblocking(False)
+
+        await send_tunnel_cmd_response(stream, REP_SUCCESS)
+
+        async def ptcp_to_target_udp():
+            try:
+                while True:
+                    frame = await read_udp_frame(stream)
+                    rsv, frag, atyp, dst_host, dst_port, payload = parse_udp_packet(frame)
+                    await loop.sock_sendto(server_udp_sock, payload, (dst_host, dst_port))
+            except Exception:
+                pass
+
+        async def target_udp_to_ptcp():
+            try:
+                while True:
+                    payload, target_addr = await loop.sock_recvfrom(server_udp_sock, 65536)
+                    target_host, target_port = target_addr[0], target_addr[1]
+                    resp_frame = pack_udp_packet(target_host, target_port, payload)
+                    await send_udp_frame(stream, resp_frame)
+            except Exception:
+                pass
+
+        t1 = asyncio.create_task(ptcp_to_target_udp())
+        t2 = asyncio.create_task(target_udp_to_ptcp())
+
+        await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
+
+        for t in (t1, t2):
+            t.cancel()
+
+        server_udp_sock.close()
+----------
+
+server\users.jsonl
+[READ_ONLY]
+{"username": "client_user", "password": "client_password"}
+{"username": "admin", "password": "secretpassword"}
+----------
+
+server\users.jsonl.example
+[READ_ONLY]
+{"username": "client_user", "password": "client_password"}
+{"username": "admin", "password": "secretpassword"}
+{"username": "friend", "password": "friendpassword"}
+----------
+
+docker-compose.yml
+[READ_ONLY]
+version: '3.3'
+
+services:
+  aptcp-server:
+    build: .
+    container_name: aptcp-socks-server
+    restart: unless-stopped
+    ports:
+      - "1080:1080"
+    volumes:
+      - ./server/config.json:/app/server/config.json
+      - ./server/users.jsonl:/app/server/users.jsonl
+      # Для использования TLS раскомментируйте строки ниже и положите сертификаты в папку server:
+      # - ./server/cert.pem:/app/server/cert.pem
+      # - ./server/key.pem:/app/server/key.pem
+----------
+
+Dockerfile
+[READ_ONLY]
+FROM python:3.11-slim
+
+WORKDIR /app
+ENV PYTHONPATH=/app
+
+# Сначала копируем только requirements.txt для кэширования слоя зависимостей
+COPY requirements.txt /app/
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Копируем весь исходный код проекта
+COPY . /app/
+
+# Пробрасываем порт по умолчанию
+EXPOSE 1080
+
+# Запускаем сервер с конфигом по умолчанию
+CMD ["python", "server/main.py", "server/config.json"]
+----------
+
+README.md
+[READ_ONLY]
+# APTCP-SOCKS Tunnel
+
+> **Note**: The original documentation in Russian is available in [README_ru.md](README_ru.md).
+
+**APTCP-SOCKS Tunnel** is an asynchronous SOCKS5 proxy server and client operating over the session-based **APTCP** (`aioptcp`) transport protocol. It provides high fault tolerance and seamless connection continuity during short-term network disruptions, interface switching (Wi-Fi/LTE), or IP address changes.
+
+The project supports full **SOCKS5 (RFC 1928)** functionality, including **TCP CONNECT** and **UDP ASSOCIATE** (for SOCKS5 clients such as Proxifier, Postern, etc.), as well as authentication under the **RFC 1929** standard via `.jsonl` files.
+
+---
+
+## Key Features & Architecture
+
+* **Network Connection Resilience:** During temporary network outages, the logical SOCKS5 channel does not drop but buffers transmitted data. `aioptcp` automatically restores the underlying physical TCP channel in the background without any packet loss.
+* **Full UDP Support:** Complete implementation of the SOCKS5 `UDP ASSOCIATE` command. It proxies UDP datagrams in both directions over a single resilient tunnel.
+* **Two-tier Authentication:**
+  1. Application $\rightarrow$ SOCKS5 Client (RFC 1929 Username/Password).
+  2. SOCKS5 Client $\rightarrow$ APTCP Server (Tunnel Authentication).
+* **JSONL User Configuration:** Easily manage user accounts using simple `{"username": "...", "password": "..."}` JSON lines.
+* **TLS Encryption Support:** Optional traffic encryption between client and server with server certificate verification.
+
+---
+
+## Project Directory Tree
+
+```text
+.
+├── common/                 # Common modules (config parsing, SOCKS5 parser, tunnel framing)
+│   ├── config.py
+│   ├── socks5.py
+│   └── tunnel.py
+├── client/                 # Local SOCKS5 proxy client
+│   ├── aptcp_client.py
+│   ├── socks_server.py
+│   ├── config.json.example # Client configuration template
+│   ├── users.jsonl
+│   └── main.py
+├── server/                 # Remote APTCP SOCKS5 server
+│   ├── aptcp_server.py
+│   ├── socks_handler.py
+│   ├── config.json.example # Server configuration template
+│   ├── users.jsonl.example # Server users template
+│   └── main.py
+├── tests/                  # Autotests (SOCKS5, Tunnel, Auth, E2E, and resilience tests)
+├── Dockerfile              # Dockerfile for the server side
+├── docker-compose.yml      # Docker Compose configuration for the server
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## Linux Server Deployment
+
+The server side supports two deployment scenarios: automated deployment using Docker Compose and manual start.
+
+### Option A: Deployment via Docker Compose (Recommended)
+
+This is the easiest way to deploy the server. It does not require installing Python or dependencies on the host machine.
+
+1. Copy the following files and directories to your remote Linux server:
+   * `common/`
+   * `server/`
+   * `Dockerfile`
+   * `docker-compose.yml`
+   * `requirements.txt`
+2. Create configuration files from the templates:
+   ```bash
+   cp server/config.json.example server/config.json
+   cp server/users.jsonl.example server/users.jsonl
+   ```
+3. (Optional) Edit the authorization credentials in `server/users.jsonl` and network ports in `server/config.json`. The default port is `1080`.
+4. Start the service in the background:
+   ```bash
+   docker compose up -d
+   ```
+5. Check logs to ensure everything is running correctly:
+   ```bash
+   docker compose logs -f
+   ```
+
+---
+
+### Option B: Manual Host Start
+
+1. Ensure Python 3.11+ is installed on your system.
+2. Install the required dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Copy the configuration templates:
+   ```bash
+   cp server/config.json.example server/config.json
+   cp server/users.jsonl.example server/users.jsonl
+   ```
+4. Set up authorization credentials in `server/users.jsonl`.
+5. Run the server:
+   ```bash
+   python -m server.main server/config.json
+   ```
+
+---
+
+## Authentication Explained (Two Password Levels)
+
+The system uses a two-stage authentication mechanism. To avoid configuration confusion, please note the difference between local and tunnel authentication:
+
+### 1. Local Authentication (Your App/Proxifier &rarr; Local Client)
+* **What it does:** Controls whether local applications (like Proxifier) are allowed to connect to the locally running SOCKS5 proxy on port `1080`.
+* **Configuration:** Managed in `client/config.json` via the `"auth_enabled"` flag and the user list in `client/users.jsonl`.
+* **How it works:**
+  * If `"auth_enabled": true`, you **must** enable authentication in your Proxifier settings and enter one of the credentials defined in `client/users.jsonl` (e.g., `proxifier` / `proxifier_password`).
+  * If `"auth_enabled": false`, Proxifier will access the local SOCKS5 proxy **without a password** (select *«None»* / *«No Authentication»* in Proxifier). The tunnel to the remote server will still remain fully secure!
+
+### 2. Tunnel Authentication (Local Client &rarr; Remote APTCP Server)
+* **What it does:** Grants the local client permission to establish a secure transport tunnel with the remote server.
+* **Configuration:** Configured in `client/config.json` (the `"aptcp_username"` and `"aptcp_password"` fields) and validated against `server/users.jsonl` on the server.
+* **How it works:**
+  * The local client **always** reads the username/password from its own `client/config.json` and submits them to the remote server on connection.
+  * **You do not need to enter these credentials in Proxifier!** Proxifier is completely unaware of the tunnel transport auth; the client handles it under the hood automatically.
+
+---
+
+## Client Setup and Launch
+
+The client runs on your local machine and provides a standard local SOCKS5 port for applications.
+
+1. Copy the client configuration template:
+   ```bash
+   cp client/config.json.example client/config.json
+   ```
+2. Edit `client/config.json`, specifying:
+   * `aptcp_server_host`: The IP address or domain name of your remote Linux server.
+   * `aptcp_server_port`: The port where your APTCP server is listening (default is `1080`).
+   * `aptcp_username` / `aptcp_password`: The credentials defined on the server side in `users.jsonl`.
+3. Set up the local authentication database for your apps by copying and editing the user list template:
+   ```bash
+   cp client/users.jsonl.example client/users.jsonl
+   ```
+   *(Enter these credentials into your Proxifier/Postern settings if local auth is enabled).*
+4. Start the client application:
+   ```bash
+   python -m client.main client/config.json
+   ```
+
+---
+
+## TLS Configuration (Tunnel Encryption)
+
+To protect your traffic from deep packet inspection (DPI) and third-party analysis, we highly recommend enabling TLS encryption between the SOCKS5 client and the APTCP server.
+
+### 1. Self-Signed Certificate Generation
+Generate a private key and a certificate on your Linux server:
+```bash
+openssl req -x509 -newkey rsa:2048 -keyout server/key.pem -out server/cert.pem -days 365 -nodes -subj "/CN=your_domain_or_ip"
+```
+*Ensure that both `key.pem` and `cert.pem` are saved inside the `server/` directory.*
+
+### 2. Server Configuration
+Enable TLS support in `server/config.json`:
+```json
+{
+  "aptcp_host": "0.0.0.0",
+  "aptcp_port": 1080,
+  "auth_enabled": true,
+  "users_file": "server/users.jsonl",
+  "timeout": 30,
+  "tls_enabled": true,
+  "tls_cert": "server/cert.pem",
+  "tls_key": "server/key.pem"
+}
+```
+*If using Docker Compose, make sure to uncomment the certificate volumes in `docker-compose.yml` before starting.*
+
+### 3. Client Configuration
+1. Copy the public server certificate (`cert.pem`) from your server to your local machine, saving it as `client/server_cert.pem`.
+2. Activate TLS in `client/config.json`:
+   ```json
+   {
+     ...
+     "aptcp_tls_enabled": true,
+     "aptcp_tls_ca_cert": "client/server_cert.pem"
+   }
+   ```
+   *Note:* If you are using a self-signed certificate and omit the `aptcp_tls_ca_cert` parameter, the client will connect in an insecure mode (disabling certificate and host validation), which is convenient for quick debugging but not recommended for production use.
+
+---
+
+## Running Tests
+
+The test suite checks SOCKS5, UDP, authentication, and background session restoration resilience:
+
+```bash
+# Run all tests
+pytest -v
+
+# Run E2E tests (including physical link reconnection tests)
+pytest tests/test_e2e.py -v
+```
+
+---
+
+## License
+
+Copyright 2026 APTCP-SOCKS Tunnel (https://github.com/Doctorgth)
+
+Licensed under the Apache License, Version 2.0.
+----------
+
+common\__init__.py
+[READ_ONLY]
+# Common package initialization
+----------
+
+common\config.py
+[READ_ONLY]
+import json
+import os
+from typing import Dict, Any
+
+def load_json_config(path: str) -> Dict[str, Any]:
+    """Loads a JSON configuration file."""
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def load_users_jsonl(path: str) -> Dict[str, str]:
+    """
+    Loads username/password pairs from a JSONL file.
+    Each line must be a JSON object: {"username": "...", "password": "..."}
+    """
+    users = {}
+    if not os.path.exists(path):
+        return users
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+            if "username" in data and "password" in data:
+                users[data["username"]] = str(data["password"])
+    return users
+
+def validate_credentials(users: Dict[str, str], username: str, password: str) -> bool:
+    """Validates given username and password against users dictionary."""
+    return users.get(username) == password
+----------
+
+common\socks5.py
+[READ_ONLY]
+import socket
+import struct
+import ipaddress
+from typing import Tuple, Callable, Awaitable
+
+SOCKS_VERSION = 0x05
+
+METHOD_NO_AUTH = 0x00
+METHOD_USER_PASS = 0x02
+METHOD_NO_ACCEPTABLE = 0xFF
+
+CMD_CONNECT = 0x01
+CMD_BIND = 0x02
+CMD_UDP_ASSOCIATE = 0x03
+
+ATYP_IPV4 = 0x01
+ATYP_DOMAIN = 0x03
+ATYP_IPV6 = 0x04
+
+REP_SUCCESS = 0x00
+REP_GENERAL_FAILURE = 0x01
+REP_CONN_NOT_ALLOWED = 0x02
+REP_NET_UNREACHABLE = 0x03
+REP_HOST_UNREACHABLE = 0x04
+REP_CONN_REFUSED = 0x05
+REP_CMD_NOT_SUPPORTED = 0x07
+REP_ATYP_NOT_SUPPORTED = 0x08
+
+
+def pack_socks_address(host: str, port: int) -> bytes:
+    """Packs host and port into SOCKS5 ATYP + ADDR + PORT format."""
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.version == 4:
+            return struct.pack('!B', ATYP_IPV4) + ip.packed + struct.pack('!H', port)
+        else:
+            return struct.pack('!B', ATYP_IPV6) + ip.packed + struct.pack('!H', port)
+    except ValueError:
+        encoded = host.encode('utf-8')
+        if len(encoded) > 255:
+            raise ValueError("Domain name exceeds 255 bytes limit")
+        return struct.pack('!BB', ATYP_DOMAIN, len(encoded)) + encoded + struct.pack('!H', port)
+
+
+async def read_socks_address(read_exact_func: Callable[[int], Awaitable[bytes]]) -> Tuple[int, str, int, bytes]:
+    """
+    Reads SOCKS5 address structure from a stream function read_exact_func(n).
+    Returns (atyp, host_str, port_int, raw_bytes).
+    """
+    atyp_bytes = await read_exact_func(1)
+    atyp = atyp_bytes[0]
+    raw_acc = bytearray(atyp_bytes)
+
+    if atyp == ATYP_IPV4:
+        addr_bytes = await read_exact_func(4)
+        raw_acc.extend(addr_bytes)
+        host = socket.inet_ntoa(addr_bytes)
+    elif atyp == ATYP_DOMAIN:
+        len_byte = await read_exact_func(1)
+        raw_acc.extend(len_byte)
+        domain_len = len_byte[0]
+        domain_bytes = await read_exact_func(domain_len)
+        raw_acc.extend(domain_bytes)
+        host = domain_bytes.decode('utf-8', errors='ignore')
+    elif atyp == ATYP_IPV6:
+        addr_bytes = await read_exact_func(16)
+        raw_acc.extend(addr_bytes)
+        host = socket.inet_ntop(socket.AF_INET6, addr_bytes)
+    else:
+        raise ValueError(f"Unsupported SOCKS5 ATYP: {atyp}")
+
+    port_bytes = await read_exact_func(2)
+    raw_acc.extend(port_bytes)
+    port = struct.unpack('!H', port_bytes)[0]
+
+    return atyp, host, port, bytes(raw_acc)
+
+
+def parse_udp_packet(data: bytes) -> Tuple[int, int, int, str, int, bytes]:
+    """
+    Parses SOCKS5 UDP datagram header (RFC 1928 Section 7):
+    +----+------+------+----------+----------+----------+
+    |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
+    +----+------+------+----------+----------+----------+
+    Returns (rsv, frag, atyp, dst_host, dst_port, payload).
+    """
+    if len(data) < 10:
+        raise ValueError("UDP packet too short for SOCKS5 header")
+    rsv, frag, atyp = struct.unpack('!HBB', data[:4])
+    idx = 4
+    if atyp == ATYP_IPV4:
+        dst_host = socket.inet_ntoa(data[idx:idx+4])
+        idx += 4
+    elif atyp == ATYP_DOMAIN:
+        domain_len = data[idx]
+        idx += 1
+        dst_host = data[idx:idx+domain_len].decode('utf-8', errors='ignore')
+        idx += domain_len
+    elif atyp == ATYP_IPV6:
+        dst_host = socket.inet_ntop(socket.AF_INET6, data[idx:idx+16])
+        idx += 16
+    else:
+        raise ValueError(f"Invalid SOCKS5 UDP ATYP: {atyp}")
+
+    dst_port = struct.unpack('!H', data[idx:idx+2])[0]
+    idx += 2
+    payload = data[idx:]
+    return rsv, frag, atyp, dst_host, dst_port, payload
+
+
+def pack_udp_packet(dst_host: str, dst_port: int, payload: bytes, frag: int = 0) -> bytes:
+    """
+    Packs SOCKS5 UDP datagram header + payload.
+    """
+    header_prefix = struct.pack('!HB', 0, frag)
+    addr_bytes = pack_socks_address(dst_host, dst_port)
+    return header_prefix + addr_bytes + payload
+----------
+
+common\tunnel.py
+[READ_ONLY]
+import struct
+import asyncio
+from typing import Tuple, Any
+from common.socks5 import read_socks_address, pack_socks_address
+
+TUNNEL_VERSION = 0x01
+
+TUNNEL_AUTH_NONE = 0x00
+TUNNEL_AUTH_USER_PASS = 0x02
+
+TUNNEL_AUTH_SUCCESS = 0x00
+TUNNEL_AUTH_FAIL = 0x01
+
+
+class PTCPStream:
+    """
+    Stream adapter wrapping a PTCPSocket or custom socket object
+    to support byte-level readexactly and send methods.
+    """
+    def __init__(self, ptcp_socket: Any):
+        self.socket = ptcp_socket
+        self._buffer = bytearray()
+
+    async def readexactly(self, n: int) -> bytes:
+        while len(self._buffer) < n:
+            chunk = await self.socket.recv(65536)
+            if not chunk:
+                raise asyncio.IncompleteReadError(bytes(self._buffer), n)
+            self._buffer.extend(chunk)
+        res = bytes(self._buffer[:n])
+        del self._buffer[:n]
+        return res
+
+    async def read(self, max_bytes: int = 65536) -> bytes:
+        if self._buffer:
+            res = bytes(self._buffer[:max_bytes])
+            del self._buffer[:max_bytes]
+            return res
+        return await self.socket.recv(max_bytes)
+
+    async def send(self, data: bytes) -> bool:
+        return await self.socket.send(data)
+
+    async def close(self):
+        await self.socket.close()
+
+
+async def send_tunnel_auth_request(stream: PTCPStream, username: str = "", password: str = "", auth_type: int = TUNNEL_AUTH_NONE):
+    if auth_type == TUNNEL_AUTH_NONE:
+        header = struct.pack('!BB', TUNNEL_VERSION, TUNNEL_AUTH_NONE)
+        await stream.send(header)
+    elif auth_type == TUNNEL_AUTH_USER_PASS:
+        u_bytes = username.encode('utf-8')
+        p_bytes = password.encode('utf-8')
+        header = struct.pack('!BBB', TUNNEL_VERSION, TUNNEL_AUTH_USER_PASS, len(u_bytes)) + u_bytes + struct.pack('!B', len(p_bytes)) + p_bytes
+        await stream.send(header)
+
+
+async def read_tunnel_auth_request(stream: PTCPStream) -> Tuple[int, str, str]:
+    ver_auth = await stream.readexactly(2)
+    ver, auth_type = ver_auth[0], ver_auth[1]
+    if ver != TUNNEL_VERSION:
+        raise ValueError(f"Unsupported Tunnel Protocol Version: {ver}")
+
+    if auth_type == TUNNEL_AUTH_NONE:
+        return auth_type, "", ""
+    elif auth_type == TUNNEL_AUTH_USER_PASS:
+        u_len = (await stream.readexactly(1))[0]
+        u_bytes = await stream.readexactly(u_len)
+        p_len = (await stream.readexactly(1))[0]
+        p_bytes = await stream.readexactly(p_len)
+        return auth_type, u_bytes.decode('utf-8', errors='ignore'), p_bytes.decode('utf-8', errors='ignore')
+    else:
+        raise ValueError(f"Unknown Tunnel Auth Type: {auth_type}")
+
+
+async def send_tunnel_auth_response(stream: PTCPStream, status: int):
+    await stream.send(struct.pack('!B', status))
+
+
+async def read_tunnel_auth_response(stream: PTCPStream) -> int:
+    b = await stream.readexactly(1)
+    return b[0]
+
+
+async def send_tunnel_cmd_request(stream: PTCPStream, cmd: int, host: str, port: int):
+    addr_bytes = pack_socks_address(host, port)
+    data = struct.pack('!B', cmd) + addr_bytes
+    await stream.send(data)
+
+
+async def read_tunnel_cmd_request(stream: PTCPStream) -> Tuple[int, int, str, int]:
+    cmd_byte = await stream.readexactly(1)
+    cmd = cmd_byte[0]
+    atyp, host, port, _ = await read_socks_address(stream.readexactly)
+    return cmd, atyp, host, port
+
+
+async def send_tunnel_cmd_response(stream: PTCPStream, rep: int, bound_host: str = "0.0.0.0", bound_port: int = 0):
+    addr_bytes = pack_socks_address(bound_host, bound_port)
+    data = struct.pack('!B', rep) + addr_bytes
+    await stream.send(data)
+
+
+async def read_tunnel_cmd_response(stream: PTCPStream) -> Tuple[int, int, str, int]:
+    rep_byte = await stream.readexactly(1)
+    rep = rep_byte[0]
+    atyp, host, port, _ = await read_socks_address(stream.readexactly)
+    return rep, atyp, host, port
+
+
+async def send_udp_frame(stream: PTCPStream, payload: bytes):
+    """Sends a length-prefixed UDP frame over APTCP stream."""
+    length = len(payload)
+    if length > 65535:
+        raise ValueError("UDP payload too large for single frame")
+    header = struct.pack('!H', length)
+    await stream.send(header + payload)
+
+
+async def read_udp_frame(stream: PTCPStream) -> bytes:
+    """Reads a length-prefixed UDP frame from APTCP stream."""
+    length_bytes = await stream.readexactly(2)
+    length = struct.unpack('!H', length_bytes)[0]
+    return await stream.readexactly(length)
+----------
+

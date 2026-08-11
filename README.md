@@ -20,6 +20,34 @@ The project supports full **SOCKS5 (RFC 1928)** functionality, including **TCP C
 
 ---
 
+## Quick Server Deployment (Linux)
+
+The easiest way to set up the APTCP server is to use the included `install.sh` script located in the root directory. This script automates repository cloning, configuration setup (port, users), and optional TLS certificate generation.
+
+### Running the Installer
+
+If you have uploaded the `install.sh` file from a Windows machine, you **must** clean it from Windows line endings and grant execution permissions before running:
+
+1. **Fix line endings:**
+   ```bash
+   sed -i 's/\r//' install.sh
+   ```
+2. **Make it executable:**
+   ```bash
+   chmod +x install.sh
+   ```
+3. **Run the script:**
+   ```bash
+   ./install.sh
+   ```
+
+Alternatively, you can run the installer directly via a one-liner:
+```bash
+curl -O https://raw.githubusercontent.com/Doctorgth/APTCP-SOCKS/main/install.sh && sed -i 's/\r//' install.sh && chmod +x install.sh && ./install.sh
+```
+
+---
+
 ## Project Directory Tree
 
 ```text
