@@ -40,4 +40,4 @@ class APTCPSocksServer:
                 asyncio.create_task(self.handler.handle_connection(conn))
             except Exception as e:
                 logger.error(f"Error accepting APTCP connection: {e}")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.001)

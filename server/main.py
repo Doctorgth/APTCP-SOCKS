@@ -3,6 +3,13 @@ import logging
 import sys
 import os
 
+# Поддержка сверхбыстрого C-based event loop для Linux
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    pass
+
 from common.config import load_json_config
 from server.aptcp_server import APTCPSocksServer
 

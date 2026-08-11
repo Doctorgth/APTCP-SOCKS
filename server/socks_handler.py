@@ -19,12 +19,46 @@ from common.tunnel import (
 logger = logging.getLogger("SOCKS5ServerHandler")
 
 
+import time
+
 class TunnelHandler:
+    _dns_cache: Dict[str, tuple[str, float]] = {}  # domain -> (ip, expire_time)
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.auth_enabled = config.get("auth_enabled", False)
         self.users_file = config.get("users_file", "server/users.jsonl")
         self.users = load_users_jsonl(self.users_file) if self.auth_enabled else {}
+
+    @classmethod
+    async def _async_resolve_host(cls, host: str) -> str:
+        """Сверхбыстрый асинхронный резолвер DNS с кэшированием IP в памяти."""
+        # 1. Проверяем, является ли хост готовым IP-адресом
+        try:
+            socket.inet_aton(host)
+            return host
+        except socket.error:
+            pass
+
+        now = time.time()
+        # 2. Проверяем горячий кэш
+        if host in cls._dns_cache:
+            ip, expire = cls._dns_cache[host]
+            if now < expire:
+                return ip
+
+        # 3. Асинхронный резолв без блокировки EventLoop
+        try:
+            loop = asyncio.get_running_loop()
+            info = await loop.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+            if info:
+                resolved_ip = info[0][4][0]
+                cls._dns_cache[host] = (resolved_ip, now + 60.0)  # TTL 60 секунд
+                return resolved_ip
+        except Exception:
+            pass
+
+        return host
 
     async def handle_connection(self, ptcp_socket: Any):
         stream = PTCPStream(ptcp_socket)
@@ -64,7 +98,18 @@ class TunnelHandler:
 
     async def _handle_tcp_connect(self, stream: PTCPStream, host: str, port: int):
         try:
-            target_reader, target_writer = await asyncio.open_connection(host, port)
+            # Асинхронный резолвинг с кэшированием для исключения задержек
+            target_ip = await self._async_resolve_host(host)
+            target_reader, target_writer = await asyncio.open_connection(target_ip, port)
+            
+            # Отключаем алгоритм Нейгла для мгновенной передачи маленьких пакетов без буферизации 40-200мс
+            sock = target_writer.get_extra_info('socket')
+            if sock:
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except Exception:
+                    pass
+
         except Exception as e:
             logger.warning(f"Target connection failed to {host}:{port} - {e}")
             await send_tunnel_cmd_response(stream, REP_CONN_REFUSED)
