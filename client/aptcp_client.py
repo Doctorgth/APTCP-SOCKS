@@ -15,7 +15,7 @@ class APTCPTunnelClient:
         self.tls_enabled = tls_enabled
         self.tls_ca_cert = tls_ca_cert
 
-    async def connect_and_authenticate(self, auth_enabled: bool, username: str = "", password: str = "") -> PTCPStream:
+    async def connect_stream(self) -> PTCPStream:
         ssl_ctx = None
         if self.tls_enabled:
             ssl_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
@@ -27,8 +27,10 @@ class APTCPTunnelClient:
 
         client = PTCPClient(self.host, self.port, timeout=self.timeout, ssl=ssl_ctx)
         await client.connect()
-        stream = PTCPStream(client)
+        return PTCPStream(client)
 
+    async def connect_and_authenticate(self, auth_enabled: bool, username: str = "", password: str = "") -> PTCPStream:
+        stream = await self.connect_stream()
         if auth_enabled:
             await send_tunnel_auth_request(stream, username, password, auth_type=TUNNEL_AUTH_USER_PASS)
         else:
