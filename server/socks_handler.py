@@ -161,7 +161,7 @@ class TunnelHandler:
         async def target_to_channel():
             try:
                 while True:
-                    data = await target_reader.read(65536)
+                    data = await target_reader.read(16384)
                     if not data:
                         break
                     await channel.send(data)

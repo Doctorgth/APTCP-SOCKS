@@ -94,6 +94,13 @@ class MuxSession:
     async def send_frame(self, stream_id: int, frame_type: int, payload: bytes = b""):
         if self.is_closed:
             return
+        # Нарезаем большие пачки данных на стабильные куски до 32КБ, чтобы не переполнять заголовок H (макс 65535)
+        chunk_size = 32768
+        if len(payload) > chunk_size:
+            for i in range(0, len(payload), chunk_size):
+                await self.send_frame(stream_id, frame_type, payload[i:i+chunk_size])
+            return
+
         header = struct.pack("!IBH", stream_id, frame_type, len(payload))
         async with self._write_lock:
             try:
@@ -135,8 +142,8 @@ class MuxSession:
                         if self.on_new_stream_cb:
                             asyncio.create_task(self.on_new_stream_cb(channel, payload))
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"MuxSession _read_loop error: {e}", exc_info=True)
         finally:
             self.is_closed = True
             for ch in list(self.channels.values()):

@@ -202,7 +202,7 @@ class SOCKS5Server:
         async def client_to_channel():
             try:
                 while True:
-                    data = await reader.read(65536)
+                    data = await reader.read(16384)
                     if not data:
                         break
                     await channel.send(data)
