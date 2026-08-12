@@ -107,6 +107,7 @@ class TunnelHandler:
                 return res
 
             atyp, host, port, _ = await read_socks_address(mock_read)
+            logger.info(f"[MUX] Stream {channel.stream_id} request: cmd={cmd}, host={host}:{port}")
 
             if cmd == CMD_CONNECT:
                 await self._handle_tcp_connect(channel, host, port)
@@ -122,8 +123,12 @@ class TunnelHandler:
 
     async def _handle_tcp_connect(self, channel: MuxChannel, host: str, port: int):
         try:
+            logger.info(f"[MUX] Stream {channel.stream_id} Resolving DNS for: {host}")
             target_ip = await self._async_resolve_host(host)
+            logger.info(f"[MUX] Stream {channel.stream_id} DNS Resolved {host} -> {target_ip}. Connecting to target...")
+            
             target_reader, target_writer = await asyncio.open_connection(target_ip, port)
+            logger.info(f"[MUX] Stream {channel.stream_id} Connected to target {host}:{port} successfully!")
 
             sock = target_writer.get_extra_info('socket')
             if sock:

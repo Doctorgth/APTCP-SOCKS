@@ -21,6 +21,10 @@ class APTCPTunnelClient:
             ssl_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
             if self.tls_ca_cert:
                 ssl_ctx.load_verify_locations(cafile=self.tls_ca_cert)
+                # Отключаем проверку hostname, так как мы подключаемся по IP-адресу, 
+                # но оставляем проверку валидности самого файла сертификата
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_REQUIRED
             else:
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
