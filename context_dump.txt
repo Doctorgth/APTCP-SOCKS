@@ -157,29 +157,27 @@ server\socks_handler.py
 import asyncio
 import socket
 import logging
+import time
 from typing import Dict, Any
 
 from common.config import load_users_jsonl, validate_credentials
 from common.socks5 import (
     CMD_CONNECT, CMD_UDP_ASSOCIATE,
     REP_SUCCESS, REP_CONN_REFUSED, REP_CMD_NOT_SUPPORTED,
-    parse_udp_packet, pack_udp_packet
+    parse_udp_packet, pack_udp_packet, read_socks_address, pack_socks_address
 )
 from common.tunnel import (
     PTCPStream, read_tunnel_auth_request, send_tunnel_auth_response,
-    read_tunnel_cmd_request, send_tunnel_cmd_response,
-    TUNNEL_AUTH_USER_PASS, TUNNEL_AUTH_SUCCESS, TUNNEL_AUTH_FAIL,
-    send_udp_frame, read_udp_frame
+    TUNNEL_AUTH_USER_PASS, TUNNEL_AUTH_SUCCESS, TUNNEL_AUTH_FAIL
 )
+from common.mux import MuxSession, MuxChannel, FRAME_OPEN_RESP
 
 logger = logging.getLogger("SOCKS5ServerHandler")
 
 
-import time
-
 class TunnelHandler:
     _dns_cache: Dict[str, tuple[str, float]] = {}  # domain -> (ip, expire_time)
-    _dns_futures: Dict[str, asyncio.Future] = {}   # in-flight DNS requests (предотвращает Thundering Herd)
+    _dns_futures: Dict[str, asyncio.Future] = {}   # in-flight DNS requests
 
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -189,7 +187,7 @@ class TunnelHandler:
 
     @classmethod
     async def _async_resolve_host(cls, host: str) -> str:
-        """Сверхбыстрый асинхронный резолвер DNS с зашитой от шторма запросов."""
+        """Сверхбыстрый асинхронный резолвер DNS с защитой от шторма запросов."""
         try:
             socket.inet_aton(host)
             return host
@@ -202,7 +200,6 @@ class TunnelHandler:
             if now < expire:
                 return ip
 
-        # Если этот же домен уже резолвится прямо сейчас в параллельном таске — ждем его результат
         if host in cls._dns_futures:
             try:
                 return await cls._dns_futures[host]
@@ -216,7 +213,7 @@ class TunnelHandler:
         try:
             info = await loop.getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
             resolved_ip = info[0][4][0] if info else host
-            cls._dns_cache[host] = (resolved_ip, now + 300.0)  # Кэш на 5 минут
+            cls._dns_cache[host] = (resolved_ip, now + 300.0)
             future.set_result(resolved_ip)
             return resolved_ip
         except Exception as e:
@@ -229,7 +226,7 @@ class TunnelHandler:
     async def handle_connection(self, ptcp_socket: Any):
         stream = PTCPStream(ptcp_socket)
         try:
-            # 1. Tunnel Authentication
+            # 1. Tunnel Authentication (выполняется 1 раз при установлении Mux туннеля)
             auth_type, username, password = await read_tunnel_auth_request(stream)
             if self.auth_enabled:
                 if auth_type != TUNNEL_AUTH_USER_PASS or not validate_credentials(self.users, username, password):
@@ -241,35 +238,54 @@ class TunnelHandler:
             else:
                 await send_tunnel_auth_response(stream, TUNNEL_AUTH_SUCCESS)
 
-            # 2. Command Request
-            cmd, atyp, host, port = await read_tunnel_cmd_request(stream)
-
-            if cmd == CMD_CONNECT:
-                await self._handle_tcp_connect(stream, host, port)
-            elif cmd == CMD_UDP_ASSOCIATE:
-                await self._handle_udp_associate(stream, host, port)
-            else:
-                await send_tunnel_cmd_response(stream, REP_CMD_NOT_SUPPORTED)
-                await stream.close()
+            # 2. Переходим в мультиплексированный режим
+            mux_session = MuxSession(stream, is_server=True, on_new_stream_cb=self._handle_mux_stream)
+            await mux_session._read_loop_task
 
         except (asyncio.IncompleteReadError, ConnectionResetError):
             pass
         except Exception as e:
-            print(f"\n[SERVER EXCEPTION] {e}")
-            logger.error(f"Error handling tunnel connection: {e}", exc_info=True)
+            logger.error(f"Error handling tunnel connection: {e}")
         finally:
             try:
                 await stream.close()
             except Exception:
                 pass
 
-    async def _handle_tcp_connect(self, stream: PTCPStream, host: str, port: int):
+    async def _handle_mux_stream(self, channel: MuxChannel, payload: bytes):
         try:
-            # Асинхронный резолвинг с кэшированием для исключения задержек
+            cmd = payload[0]
+            idx = 1
+            async def mock_read(n):
+                nonlocal idx
+                res = payload[idx:idx+n]
+                idx += n
+                return res
+
+            atyp, host, port, _ = await read_socks_address(mock_read)
+            logger.info(f"[MUX] Stream {channel.stream_id} request: cmd={cmd}, host={host}:{port}")
+
+            if cmd == CMD_CONNECT:
+                await self._handle_tcp_connect(channel, host, port)
+            elif cmd == CMD_UDP_ASSOCIATE:
+                await self._handle_udp_associate(channel, host, port)
+            else:
+                resp_payload = bytes([REP_CMD_NOT_SUPPORTED]) + pack_socks_address("0.0.0.0", 0)
+                await channel.session.send_frame(channel.stream_id, FRAME_OPEN_RESP, resp_payload)
+                await channel.close()
+        except Exception as e:
+            logger.error(f"Error in Mux stream handler: {e}")
+            await channel.close()
+
+    async def _handle_tcp_connect(self, channel: MuxChannel, host: str, port: int):
+        try:
+            logger.info(f"[MUX] Stream {channel.stream_id} Resolving DNS for: {host}")
             target_ip = await self._async_resolve_host(host)
-            target_reader, target_writer = await asyncio.open_connection(target_ip, port)
+            logger.info(f"[MUX] Stream {channel.stream_id} DNS Resolved {host} -> {target_ip}. Connecting to target...")
             
-            # Отключаем алгоритм Нейгла для мгновенной передачи маленьких пакетов без буферизации 40-200мс
+            target_reader, target_writer = await asyncio.open_connection(target_ip, port)
+            logger.info(f"[MUX] Stream {channel.stream_id} Connected to target {host}:{port} successfully!")
+
             sock = target_writer.get_extra_info('socket')
             if sock:
                 try:
@@ -279,15 +295,18 @@ class TunnelHandler:
 
         except Exception as e:
             logger.warning(f"Target connection failed to {host}:{port} - {e}")
-            await send_tunnel_cmd_response(stream, REP_CONN_REFUSED)
+            resp_payload = bytes([REP_CONN_REFUSED]) + pack_socks_address("0.0.0.0", 0)
+            await channel.session.send_frame(channel.stream_id, FRAME_OPEN_RESP, resp_payload)
+            await channel.close()
             return
 
-        await send_tunnel_cmd_response(stream, REP_SUCCESS)
+        resp_payload = bytes([REP_SUCCESS]) + pack_socks_address("0.0.0.0", 0)
+        await channel.session.send_frame(channel.stream_id, FRAME_OPEN_RESP, resp_payload)
 
-        async def ptcp_to_target():
+        async def channel_to_target():
             try:
                 while True:
-                    data = await stream.read(65536)
+                    data = await channel.read()
                     if not data:
                         break
                     target_writer.write(data)
@@ -295,52 +314,56 @@ class TunnelHandler:
             except Exception:
                 pass
 
-        async def target_to_ptcp():
+        async def target_to_channel():
             try:
                 while True:
-                    data = await target_reader.read(65536)
+                    data = await target_reader.read(16384)
                     if not data:
                         break
-                    await stream.send(data)
+                    await channel.send(data)
             except Exception:
                 pass
 
-        t1 = asyncio.create_task(ptcp_to_target())
-        t2 = asyncio.create_task(target_to_ptcp())
+        t1 = asyncio.create_task(channel_to_target())
+        t2 = asyncio.create_task(target_to_channel())
         done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
         target_writer.close()
+        await channel.close()
 
-    async def _handle_udp_associate(self, stream: PTCPStream, host: str, port: int):
+    async def _handle_udp_associate(self, channel: MuxChannel, host: str, port: int):
         loop = asyncio.get_running_loop()
         server_udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         server_udp_sock.bind(('0.0.0.0', 0))
         server_udp_sock.setblocking(False)
 
-        await send_tunnel_cmd_response(stream, REP_SUCCESS)
+        resp_payload = bytes([REP_SUCCESS]) + pack_socks_address("0.0.0.0", 0)
+        await channel.session.send_frame(channel.stream_id, FRAME_OPEN_RESP, resp_payload)
 
-        async def ptcp_to_target_udp():
+        async def channel_to_target_udp():
             try:
                 while True:
-                    frame = await read_udp_frame(stream)
+                    frame = await channel.read()
+                    if not frame:
+                        break
                     rsv, frag, atyp, dst_host, dst_port, payload = parse_udp_packet(frame)
                     await loop.sock_sendto(server_udp_sock, payload, (dst_host, dst_port))
             except Exception:
                 pass
 
-        async def target_udp_to_ptcp():
+        async def target_udp_to_channel():
             try:
                 while True:
                     payload, target_addr = await loop.sock_recvfrom(server_udp_sock, 65536)
                     target_host, target_port = target_addr[0], target_addr[1]
                     resp_frame = pack_udp_packet(target_host, target_port, payload)
-                    await send_udp_frame(stream, resp_frame)
+                    await channel.send(resp_frame)
             except Exception:
                 pass
 
-        t1 = asyncio.create_task(ptcp_to_target_udp())
-        t2 = asyncio.create_task(target_udp_to_ptcp())
+        t1 = asyncio.create_task(channel_to_target_udp())
+        t2 = asyncio.create_task(target_udp_to_channel())
 
         await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
 
@@ -348,6 +371,7 @@ class TunnelHandler:
             t.cancel()
 
         server_udp_sock.close()
+        await channel.close()
 ----------
 
 server\users.jsonl
@@ -1313,6 +1337,10 @@ class APTCPTunnelClient:
             ssl_ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
             if self.tls_ca_cert:
                 ssl_ctx.load_verify_locations(cafile=self.tls_ca_cert)
+                # Отключаем проверку hostname, так как мы подключаемся по IP-адресу, 
+                # но оставляем проверку валидности самого файла сертификата
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_REQUIRED
             else:
                 ssl_ctx.check_hostname = False
                 ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -1342,11 +1370,13 @@ client\config.json
   "socks_port": 1050,
   "auth_enabled": false,
   "users_file": "client/users.jsonl",
-  "aptcp_server_host": "127.0.0.1",
-  "aptcp_server_port": 1051,
+  "aptcp_server_host": "89.125.28.53",
+  "aptcp_server_port": 1050,
   "aptcp_auth_enabled": true,
   "aptcp_username": "test",
   "aptcp_password": "test",
+  "aptcp_tls_enabled": true,
+  "aptcp_tls_ca_cert": "C:/Users/Доктор/PycharmProjects/aptcpsoks/tls/cert.pem",
   "timeout": 30
 }
 ----------
@@ -1410,22 +1440,18 @@ client\socks_server.py
 import asyncio
 import socket
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from common.config import load_users_jsonl, validate_credentials
 from common.socks5 import (
     SOCKS_VERSION, METHOD_NO_AUTH, METHOD_USER_PASS, METHOD_NO_ACCEPTABLE,
     CMD_CONNECT, CMD_UDP_ASSOCIATE,
     REP_SUCCESS, REP_GENERAL_FAILURE, REP_CMD_NOT_SUPPORTED,
-    read_socks_address, pack_socks_address
-)
-from common.tunnel import (
-    PTCPStream, send_tunnel_auth_request, read_tunnel_auth_response,
-    send_tunnel_cmd_request, read_tunnel_cmd_response,
-    send_udp_frame, read_udp_frame,
-    TUNNEL_AUTH_USER_PASS, TUNNEL_AUTH_NONE
+    read_socks_address, pack_socks_address,
+    parse_udp_packet, pack_udp_packet
 )
 from client.aptcp_client import APTCPTunnelClient
+from common.mux import MuxSession, MuxChannel
 
 logger = logging.getLogger("SOCKS5Client")
 
@@ -1449,8 +1475,26 @@ class SOCKS5Server:
         self.timeout = int(config.get("timeout", 30))
 
         self._server = None
-        # Ограничиваем одновременно создаваемые handshakes до 10 для стабильности aioptcp
-        self._ptcp_semaphore = asyncio.Semaphore(config.get("max_concurrent_tunnels", 10))
+        self._mux_session: Optional[MuxSession] = None
+        self._mux_lock = asyncio.Lock()
+
+    async def get_mux_session(self) -> MuxSession:
+        async with self._mux_lock:
+            if self._mux_session and not self._mux_session.is_closed:
+                return self._mux_session
+
+            tunnel_client = APTCPTunnelClient(
+                self.aptcp_host,
+                self.aptcp_port,
+                timeout=self.timeout,
+                tls_enabled=self.aptcp_tls_enabled,
+                tls_ca_cert=self.aptcp_tls_ca_cert
+            )
+            ptcp_stream = await tunnel_client.connect_and_authenticate(
+                self.aptcp_auth_enabled, self.aptcp_username, self.aptcp_password
+            )
+            self._mux_session = MuxSession(ptcp_stream, is_server=False)
+            return self._mux_session
 
     async def start(self):
         self._server = await asyncio.start_server(
@@ -1463,12 +1507,13 @@ class SOCKS5Server:
             await self._server.serve_forever()
 
     async def close(self):
+        if self._mux_session:
+            await self._mux_session.close()
         if self._server:
             self._server.close()
             await self._server.wait_closed()
 
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
-        # Отключаем задержку Нейгла для мгновенного отклика SOCKS5 сокета Edge
         sock = writer.get_extra_info('socket')
         if sock:
             try:
@@ -1498,7 +1543,6 @@ class SOCKS5Server:
                 writer.write(bytes([SOCKS_VERSION, METHOD_USER_PASS]))
                 await writer.drain()
 
-                # Perform RFC 1929 Auth Subnegotiation
                 auth_ver = (await reader.readexactly(1))[0]
                 u_len = (await reader.readexactly(1))[0]
                 username = (await reader.readexactly(u_len)).decode('utf-8', errors='ignore')
@@ -1507,14 +1551,12 @@ class SOCKS5Server:
 
                 if not validate_credentials(self.users, username, password):
                     logger.warning(f"SOCKS5 auth failed for user: {username}")
-                    # Return Auth Failure status 0x01
                     writer.write(bytes([auth_ver, 0x01]))
                     await writer.drain()
                     writer.close()
                     await writer.wait_closed()
                     return
 
-                # Auth Success status 0x00
                 writer.write(bytes([auth_ver, 0x00]))
                 await writer.drain()
             else:
@@ -1541,36 +1583,12 @@ class SOCKS5Server:
                 await writer.wait_closed()
                 return
 
-            # 3. Connect to APTCP Server using standard aioptcp.PTCPClient
-            tunnel_client = APTCPTunnelClient(
-                self.aptcp_host, 
-                self.aptcp_port, 
-                timeout=self.timeout,
-                tls_enabled=self.aptcp_tls_enabled, 
-                tls_ca_cert=self.aptcp_tls_ca_cert
-            )
+            # 3. Open Virtual Channel over Multiplexed PTCP Session
             try:
-                # Ограничиваем только пиковую скорость создания handshakes, чтобы не рушить Windows IOCP
-                async with self._ptcp_semaphore:
-                    ptcp_stream = await tunnel_client.connect_stream()
-
-                    if self.aptcp_auth_enabled:
-                        await send_tunnel_auth_request(ptcp_stream, self.aptcp_username, self.aptcp_password, auth_type=TUNNEL_AUTH_USER_PASS)
-                    else:
-                        await send_tunnel_auth_request(ptcp_stream, auth_type=TUNNEL_AUTH_NONE)
-
-                    # Относим CMD сразу следом в тот же буфер
-                    await send_tunnel_cmd_request(ptcp_stream, cmd, target_host, target_port)
-
-                    # Вычитываем подтверждения
-                    auth_status = await read_tunnel_auth_response(ptcp_stream)
-                    if auth_status != 0x00:
-                        raise PermissionError("APTCP Auth failed")
-
-                    rep, bnd_atyp, bnd_host, bnd_port = await read_tunnel_cmd_response(ptcp_stream)
-
+                mux_session = await self.get_mux_session()
+                channel, rep, bnd_host, bnd_port = await mux_session.open_stream(cmd, target_host, target_port)
             except Exception as e:
-                logger.error(f"Failed to establish APTCP tunnel: {e}")
+                logger.error(f"Failed to open Mux stream: {e}")
                 rep_bytes = bytes([SOCKS_VERSION, REP_GENERAL_FAILURE, 0x00]) + pack_socks_address("0.0.0.0", 0)
                 writer.write(rep_bytes)
                 await writer.drain()
@@ -1582,35 +1600,30 @@ class SOCKS5Server:
                 rep_bytes = bytes([SOCKS_VERSION, rep, 0x00]) + pack_socks_address("0.0.0.0", 0)
                 writer.write(rep_bytes)
                 await writer.drain()
-                await ptcp_stream.close()
+                await channel.close()
                 writer.close()
                 await writer.wait_closed()
                 return
 
             # 5. Handle Command Execution
             if cmd == CMD_CONNECT:
-                # Reply Success to Proxifier
                 rep_bytes = bytes([SOCKS_VERSION, REP_SUCCESS, 0x00]) + pack_socks_address("0.0.0.0", 0)
                 writer.write(rep_bytes)
                 await writer.drain()
 
-                # Relay TCP bi-directionally
-                await self._relay_tcp(reader, writer, ptcp_stream)
+                await self._relay_tcp(reader, writer, channel)
 
             elif cmd == CMD_UDP_ASSOCIATE:
-                # Create local UDP socket for Proxifier to send datagrams to
                 udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 udp_sock.bind((self.socks_host, 0))
                 udp_sock.setblocking(False)
                 local_bnd_host, local_bnd_port = udp_sock.getsockname()
 
-                # Reply Success to Proxifier with local bound UDP address and port
                 rep_bytes = bytes([SOCKS_VERSION, REP_SUCCESS, 0x00]) + pack_socks_address(local_bnd_host, local_bnd_port)
                 writer.write(rep_bytes)
                 await writer.drain()
 
-                # Relay UDP datagrams
-                await self._relay_udp(reader, writer, udp_sock, ptcp_stream)
+                await self._relay_udp(reader, writer, udp_sock, channel)
 
         except (asyncio.IncompleteReadError, ConnectionResetError):
             pass
@@ -1623,22 +1636,22 @@ class SOCKS5Server:
             except Exception:
                 pass
 
-    async def _relay_tcp(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, ptcp_stream: PTCPStream):
-        """Relays raw TCP stream between Proxifier and APTCP stream."""
-        async def client_to_ptcp():
+    async def _relay_tcp(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, channel: MuxChannel):
+        """Relays raw TCP stream between Proxifier and Mux channel."""
+        async def client_to_channel():
             try:
                 while True:
-                    data = await reader.read(65536)
+                    data = await reader.read(16384)
                     if not data:
                         break
-                    await ptcp_stream.send(data)
+                    await channel.send(data)
             except Exception:
                 pass
 
-        async def ptcp_to_client():
+        async def channel_to_client():
             try:
                 while True:
-                    data = await ptcp_stream.read(65536)
+                    data = await channel.read()
                     if not data:
                         break
                     writer.write(data)
@@ -1646,20 +1659,20 @@ class SOCKS5Server:
             except Exception:
                 pass
 
-        t1 = asyncio.create_task(client_to_ptcp())
-        t2 = asyncio.create_task(ptcp_to_client())
+        t1 = asyncio.create_task(client_to_channel())
+        t2 = asyncio.create_task(channel_to_client())
         done, pending = await asyncio.wait([t1, t2], return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
-        await ptcp_stream.close()
+        await channel.close()
 
-    async def _relay_udp(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, udp_sock: socket.socket, ptcp_stream: PTCPStream):
-        """Relays UDP datagrams between Proxifier local UDP socket and APTCP stream."""
+    async def _relay_udp(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter, udp_sock: socket.socket, channel: MuxChannel):
+        """Relays UDP datagrams between Proxifier local UDP socket and Mux channel."""
         loop = asyncio.get_running_loop()
         proxifier_udp_addr = None
         addr_event = asyncio.Event()
 
-        async def udp_to_ptcp():
+        async def udp_to_channel():
             nonlocal proxifier_udp_addr
             try:
                 while True:
@@ -1667,15 +1680,17 @@ class SOCKS5Server:
                     if not proxifier_udp_addr:
                         proxifier_udp_addr = addr
                         addr_event.set()
-                    await send_udp_frame(ptcp_stream, data)
+                    await channel.send(data)
             except Exception:
                 pass
 
-        async def ptcp_to_udp():
+        async def channel_to_udp():
             try:
                 await addr_event.wait()
                 while True:
-                    frame = await read_udp_frame(ptcp_stream)
+                    frame = await channel.read()
+                    if not frame:
+                        break
                     if proxifier_udp_addr:
                         await loop.sock_sendto(udp_sock, frame, proxifier_udp_addr)
             except Exception:
@@ -1690,8 +1705,8 @@ class SOCKS5Server:
             except Exception:
                 pass
 
-        t_udp_in = asyncio.create_task(udp_to_ptcp())
-        t_udp_out = asyncio.create_task(ptcp_to_udp())
+        t_udp_in = asyncio.create_task(udp_to_channel())
+        t_udp_out = asyncio.create_task(channel_to_udp())
         t_tcp_ctrl = asyncio.create_task(monitor_tcp_control())
 
         await asyncio.wait([t_udp_in, t_udp_out, t_tcp_ctrl], return_when=asyncio.FIRST_COMPLETED)
@@ -1700,7 +1715,7 @@ class SOCKS5Server:
             t.cancel()
 
         udp_sock.close()
-        await ptcp_stream.close()
+        await channel.close()
 ----------
 
 client\users.jsonl
@@ -2299,11 +2314,15 @@ from common.socks5 import (
     read_socks_address, pack_socks_address
 )
 
+_echo_tasks = set()
+
 async def run_tcp_echo_server():
-    server = await asyncio.start_server(
-        lambda r, w: asyncio.create_task(_tcp_echo_handler(r, w)),
-        '127.0.0.1', 0
-    )
+    def _start_handler(r, w):
+        task = asyncio.create_task(_tcp_echo_handler(r, w))
+        _echo_tasks.add(task)
+        task.add_done_callback(_echo_tasks.discard)
+
+    server = await asyncio.start_server(_start_handler, '127.0.0.1', 0)
     port = server.sockets[0].getsockname()[1]
     return server, port
 
@@ -2323,8 +2342,8 @@ async def _tcp_echo_handler(reader, writer):
 @pytest.mark.asyncio
 async def test_burst_100_concurrent_connections():
     """
-    Эмулирует поведение браузера Edge (одновременный спам 100 сокетов)
-    и замеряет скорость и успешность обработки всех подключений.
+    Тестирует мультиплексирование: открывает 100 одновременных сокетов Edge,
+    которые передаются через ЕДИНЫЙ мультиплексированный туннель без разрывов.
     """
     with tempfile.NamedTemporaryFile('w+', delete=False, suffix='.jsonl') as f_client:
         f_client.write(json.dumps({"username": "u", "password": "p"}) + "\n")
@@ -2336,7 +2355,6 @@ async def test_burst_100_concurrent_connections():
 
     tcp_echo_srv, tcp_echo_port = await run_tcp_echo_server()
 
-    # Запускаем Сервер и Клиент
     aptcp_server = APTCPSocksServer({
         "aptcp_host": "127.0.0.1", "aptcp_port": 19095,
         "auth_enabled": True, "users_file": s_users, "timeout": 30
@@ -2355,9 +2373,8 @@ async def test_burst_100_concurrent_connections():
 
     async def single_client_connect(idx: int):
         try:
-            # Подключаемся к локальному SOCKS5 прокси
             reader, writer = await asyncio.open_connection("127.0.0.1", 11095)
-            
+
             # 1. Greeting
             writer.write(bytes([SOCKS_VERSION, 1, METHOD_USER_PASS]))
             await writer.drain()
@@ -2397,16 +2414,14 @@ async def test_burst_100_concurrent_connections():
             return False
 
     try:
-        # ЗАПУСКАЕМ ШТОРМ: 100 одновременных сокетов в 1 миллисекунду
         start_time = time.time()
         tasks = [single_client_connect(i) for i in range(100)]
         results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=10.0)
         elapsed = time.time() - start_time
 
-        # Все 100 сокетов должны успешное завершиться без ошибок и таймаутов
         assert len(results) == 100
         assert all(results)
-        print(f"\n[УСПЕХ BENCHMARK] 100 параллельных сокетов обработаны за {elapsed:.2f} сек!")
+        print(f"\n[УСПЕХ MULTIPLEXING BENCHMARK] 100 сокетов обработаны за {elapsed:.2f} сек!")
 
     finally:
         await socks_server.close()
@@ -2414,5 +2429,168 @@ async def test_burst_100_concurrent_connections():
         await tcp_echo_srv.wait_closed()
         os.remove(c_users)
         os.remove(s_users)
+----------
+
+common\mux.py
+import struct
+import asyncio
+import logging
+from typing import Dict, Optional, Any, Callable, Awaitable, Tuple
+from common.socks5 import pack_socks_address, read_socks_address
+
+logger = logging.getLogger("Mux")
+
+FRAME_OPEN = 0x01       # Client -> Server: Open stream payload=[cmd, atyp, host, port]
+FRAME_OPEN_RESP = 0x02  # Server -> Client: Open response payload=[rep, atyp, bnd_host, bnd_port]
+FRAME_DATA = 0x03       # Bi-directional: Stream payload
+FRAME_CLOSE = 0x04      # Bi-directional: Close stream
+
+class MuxChannel:
+    """Represents a single virtual bidirectional stream inside a MuxSession."""
+    def __init__(self, stream_id: int, session: 'MuxSession'):
+        self.stream_id = stream_id
+        self.session = session
+        self.read_queue = asyncio.Queue()
+        self.is_closed = False
+
+    async def read(self) -> bytes:
+        if self.is_closed and self.read_queue.empty():
+            return b""
+        data = await self.read_queue.get()
+        return data
+
+    async def send(self, data: bytes):
+        if not self.is_closed:
+            await self.session.send_frame(self.stream_id, FRAME_DATA, data)
+
+    async def close(self):
+        if not self.is_closed:
+            self.is_closed = True
+            await self.read_queue.put(b"")
+            await self.session.send_frame(self.stream_id, FRAME_CLOSE, b"")
+            self.session.remove_channel(self.stream_id)
+
+
+class MuxSession:
+    """Manages a multiplexed session over an underlying PTCPStream."""
+    def __init__(self, stream: Any, is_server: bool = False, on_new_stream_cb: Optional[Callable[[MuxChannel, bytes], Awaitable[None]]] = None):
+        self.stream = stream
+        self.is_server = is_server
+        self.on_new_stream_cb = on_new_stream_cb
+        self.channels: Dict[int, MuxChannel] = {}
+        self.next_stream_id = 1 if not is_server else 2
+        self._write_lock = asyncio.Lock()
+        self._open_futures: Dict[int, asyncio.Future] = {}
+        self.is_closed = False
+        self._read_loop_task = asyncio.create_task(self._read_loop())
+
+    def create_channel(self) -> MuxChannel:
+        stream_id = self.next_stream_id
+        self.next_stream_id += 2
+        channel = MuxChannel(stream_id, self)
+        self.channels[stream_id] = channel
+        return channel
+
+    def remove_channel(self, stream_id: int):
+        self.channels.pop(stream_id, None)
+        fut = self._open_futures.pop(stream_id, None)
+        if fut and not fut.done():
+            fut.cancel()
+
+    async def open_stream(self, cmd: int, target_host: str, target_port: int, timeout: float = 10.0) -> Tuple[MuxChannel, int, str, int]:
+        channel = self.create_channel()
+        payload = bytes([cmd]) + pack_socks_address(target_host, target_port)
+
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._open_futures[channel.stream_id] = fut
+
+        await self.send_frame(channel.stream_id, FRAME_OPEN, payload)
+
+        try:
+            resp_payload = await asyncio.wait_for(fut, timeout=timeout)
+        except Exception as e:
+            channel.is_closed = True
+            self.remove_channel(channel.stream_id)
+            raise TimeoutError(f"Timeout waiting for Mux stream open response: {e}")
+
+        rep = resp_payload[0]
+        idx = 1
+        async def mock_read(n):
+            nonlocal idx
+            res = resp_payload[idx:idx+n]
+            idx += n
+            return res
+
+        _, bnd_host, bnd_port, _ = await read_socks_address(mock_read)
+        return channel, rep, bnd_host, bnd_port
+
+    async def send_frame(self, stream_id: int, frame_type: int, payload: bytes = b""):
+        if self.is_closed:
+            return
+        # Нарезаем большие пачки данных на стабильные куски до 32КБ, чтобы не переполнять заголовок H (макс 65535)
+        chunk_size = 32768
+        if len(payload) > chunk_size:
+            for i in range(0, len(payload), chunk_size):
+                await self.send_frame(stream_id, frame_type, payload[i:i+chunk_size])
+            return
+
+        header = struct.pack("!IBH", stream_id, frame_type, len(payload))
+        async with self._write_lock:
+            try:
+                await self.stream.send(header + payload)
+            except Exception:
+                self.is_closed = True
+
+    async def _read_loop(self):
+        try:
+            while not self.is_closed:
+                header = await self.stream.readexactly(7)
+                stream_id, frame_type, payload_len = struct.unpack("!IBH", header)
+
+                payload = b""
+                if payload_len > 0:
+                    payload = await self.stream.readexactly(payload_len)
+
+                if frame_type == FRAME_DATA:
+                    channel = self.channels.get(stream_id)
+                    if channel:
+                        await channel.read_queue.put(payload)
+
+                elif frame_type == FRAME_CLOSE:
+                    channel = self.channels.get(stream_id)
+                    if channel:
+                        channel.is_closed = True
+                        await channel.read_queue.put(b"")
+                        self.channels.pop(stream_id, None)
+
+                elif frame_type == FRAME_OPEN_RESP:
+                    fut = self._open_futures.get(stream_id)
+                    if fut and not fut.done():
+                        fut.set_result(payload)
+
+                elif frame_type == FRAME_OPEN:
+                    if self.is_server:
+                        channel = MuxChannel(stream_id, self)
+                        self.channels[stream_id] = channel
+                        if self.on_new_stream_cb:
+                            asyncio.create_task(self.on_new_stream_cb(channel, payload))
+
+        except Exception as e:
+            logger.error(f"MuxSession _read_loop error: {e}", exc_info=True)
+        finally:
+            self.is_closed = True
+            for ch in list(self.channels.values()):
+                ch.is_closed = True
+                await ch.read_queue.put(b"")
+            self.channels.clear()
+
+    async def close(self):
+        self.is_closed = True
+        self._read_loop_task.cancel()
+        try:
+            await self.stream.close()
+        except Exception:
+            pass
 ----------
 
