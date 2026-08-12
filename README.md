@@ -174,7 +174,7 @@ The client runs on your local machine and provides a standard local SOCKS5 port 
 
 ## TLS Configuration (Tunnel Encryption)
 
-To protect your traffic from deep packet inspection (DPI) and third-party analysis, we highly recommend enabling TLS encryption between the SOCKS5 client and the APTCP server.
+To protect transmitted traffic, it is recommended to enable TLS encryption between the SOCKS5 client and the APTCP server.
 
 ### 1. Self-Signed Certificate Generation
 Generate a private key and a certificate on your Linux server:
